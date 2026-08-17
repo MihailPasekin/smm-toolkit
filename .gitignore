@@ -1,0 +1,41 @@
+cat > .gitignore <<'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Project generated files
+input/*
+output/*
+
+# Keep directories in Git
+!input/.gitkeep
+!output/.gitkeep
+
+# Large media files
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+
+# Logs
+*.log
+EOF

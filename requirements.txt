@@ -1,1 +1,2 @@
 openai-whisper==20250625
+webrtcvad-wheels==2.0.14

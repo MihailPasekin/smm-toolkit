@@ -56,7 +56,7 @@ def burn_subtitles(video_path: str | Path, srt_path: str | Path,
     # explicitly or FFmpeg interprets FontSize/PrimaryColour/etc. as separate
     # filter options and fails with "No option name near ...".
     force_style = (
-        "FontName=Arial\\,FontSize=24\\,PrimaryColour=&H00FFFFFF"
+        "FontName=Arial\\,FontSize=18\\,PrimaryColour=&H00FFFFFF"
         "\\,OutlineColour=&H00000000\\,Outline=2\\,Alignment=2"
     )
     subtitle_filter = f"subtitles='{subtitle_path}':force_style='{force_style}'"

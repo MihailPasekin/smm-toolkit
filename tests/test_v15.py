@@ -8,6 +8,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from cut_strategy import FixedDurationCutStrategy
 from subtitles import format_time, write_clip_srts
 from toolkit import run_pipeline
+from validator import VideoInfo
+
+
+def _video_info(duration, **overrides):
+    defaults = dict(
+        path=Path("fake.mp4"),
+        duration=duration,
+        video_codec="h264",
+        audio_codec="aac",
+        width=1280,
+        height=720,
+        fps=30.0,
+        has_audio=True,
+    )
+    defaults.update(overrides)
+    return VideoInfo(**defaults)
 
 
 def test_fixed_strategy_does_not_split_short_video():
@@ -43,10 +59,10 @@ def test_clip_subtitles_are_shifted_and_clipped(tmp_path):
 
 @patch("toolkit.has_speech", return_value=False)
 @patch("toolkit.transcribe_to_srt")
-@patch("toolkit.probe_duration", return_value=40.0)
+@patch("toolkit.validate_video", return_value=_video_info(40.0))
 @patch("toolkit.has_audio", return_value=True)
 def test_auto_skips_whisper_when_no_speech(
-    mock_audio, mock_duration, mock_transcribe, mock_speech, tmp_path
+    mock_audio, mock_validate, mock_transcribe, mock_speech, tmp_path
 ):
     video = tmp_path / "silent.mp4"
     video.write_bytes(b"fake")
@@ -63,20 +79,26 @@ def test_auto_skips_whisper_when_no_speech(
 @patch("toolkit.has_speech", return_value=True)
 @patch("toolkit.transcribe_to_srt", return_value={
     "language": "ru",
-    "segments": [{"start": 0, "end": 40, "text": "test"}],
+    "segments": [
+        {"start": 0, "end": 40, "text": "one"},
+        {"start": 65, "end": 100, "text": "two"},
+        {"start": 121, "end": 124, "text": "three"},
+    ],
     "path": "source.srt",
     "generated": True,
     "reason": None,
 })
 @patch("toolkit.burn_subtitles", side_effect=lambda video, srt, out: Path(out).write_bytes(b"burned"))
-@patch("toolkit.probe_duration", return_value=125.0)
+@patch("toolkit.validate_video")
 @patch("toolkit.has_audio", return_value=True)
 @patch("toolkit.render_cuts", return_value=[])
 def test_long_video_gets_per_clip_subtitles(
-    mock_render, mock_audio, mock_duration, mock_burn, mock_transcribe, mock_speech, tmp_path
+    mock_render, mock_audio, mock_validate, mock_burn, mock_transcribe, mock_speech, tmp_path
 ):
     video = tmp_path / "long.mp4"
     video.write_bytes(b"fake")
+
+    clip_durations = {}
 
     # Simulate the renderer output without invoking ffmpeg.
     def render(_source, clips_dir, cuts):
@@ -84,10 +106,14 @@ def test_long_video_gets_per_clip_subtitles(
         for i, cut in enumerate(cuts, 1):
             p = Path(clips_dir) / f"clip_{i:03d}.mp4"
             p.write_bytes(b"clip")
+            clip_durations[str(p)] = cut.end - cut.start
             result.append((p, cut.start, cut.end))
         return result
 
     mock_render.side_effect = render
+    mock_validate.side_effect = lambda path: _video_info(
+        clip_durations.get(str(Path(path)), 125.0)
+    )
 
     out = run_pipeline(str(video), subtitles="auto", output_root=tmp_path / "out")
 
@@ -105,7 +131,7 @@ def test_no_subtitles_never_runs_vad_or_whisper(tmp_path):
     with patch("toolkit.has_audio") as audio, \
          patch("toolkit.has_speech") as speech, \
          patch("toolkit.transcribe_to_srt") as transcribe, \
-         patch("toolkit.probe_duration", return_value=20.0):
+         patch("toolkit.validate_video", return_value=_video_info(20.0)):
         run_pipeline(str(video), subtitles="no", output_root=tmp_path / "out")
         audio.assert_not_called()
         speech.assert_not_called()
@@ -128,10 +154,10 @@ def test_cli_accepts_subtitle_modes():
     "generated": False,
     "reason": "whisper_no_segments",
 })
-@patch("toolkit.probe_duration", return_value=9.4)
+@patch("toolkit.validate_video", return_value=_video_info(9.4))
 @patch("toolkit.has_audio", return_value=True)
 def test_auto_falls_back_to_plain_video_when_whisper_finds_no_segments(
-    mock_audio, mock_duration, mock_transcribe, mock_speech, tmp_path
+    mock_audio, mock_validate, mock_transcribe, mock_speech, tmp_path
 ):
     video = tmp_path / "speech_like.mp4"
     video.write_bytes(b"fake")
@@ -163,10 +189,10 @@ def test_auto_falls_back_to_plain_video_when_whisper_finds_no_segments(
     "generated": False,
     "reason": "whisper_no_segments",
 })
-@patch("toolkit.probe_duration", return_value=9.4)
+@patch("toolkit.validate_video", return_value=_video_info(9.4))
 @patch("toolkit.has_audio", return_value=True)
 def test_yes_fails_cleanly_when_whisper_finds_no_segments(
-    mock_audio, mock_duration, mock_transcribe, mock_speech, tmp_path
+    mock_audio, mock_validate, mock_transcribe, mock_speech, tmp_path
 ):
     video = tmp_path / "speech_like.mp4"
     video.write_bytes(b"fake")

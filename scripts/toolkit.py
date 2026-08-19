@@ -6,9 +6,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
 
 try:
     from .media import has_audio, is_url, probe_duration, safe_name
@@ -16,12 +18,14 @@ try:
     from .subtitles import transcribe_to_srt, write_clip_srts
     from .render import burn_subtitles, render_cuts
     from .cut_strategy import FixedDurationCutStrategy
+    from .validator import validate_video, validate_srt, ValidationError
 except ImportError:
     from media import has_audio, is_url, probe_duration, safe_name
     from speech import has_speech
     from subtitles import transcribe_to_srt, write_clip_srts
     from render import burn_subtitles, render_cuts
     from cut_strategy import FixedDurationCutStrategy
+    from validator import validate_video, validate_srt, ValidationError
 
 VERSION = "1.5.0"
 
@@ -238,12 +242,7 @@ def download_video(url: str, output_dir: str | Path) -> Path:
         "yt-dlp",
         "--no-playlist",
         "-f",
-        (
-            "bestvideo[ext=mp4][vcodec^=avc1]+"
-            "bestaudio[ext=m4a]/"
-            "best[ext=mp4][vcodec^=avc1]/"
-            "best[ext=mp4]/best"
-        ),
+        "best[protocol^=m3u8]/best[ext=mp4]/best",
         "--merge-output-format",
         "mp4",
         "--print",
@@ -253,27 +252,47 @@ def download_video(url: str, output_dir: str | Path) -> Path:
         url,
     ]
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except FileNotFoundError as exc:
-        raise PipelineError(
-            "Не найден yt-dlp. Установите его: pip install yt-dlp"
-        ) from exc
-    except subprocess.CalledProcessError as exc:
+    # YouTube's served format list (and which formats have a working PO
+    # Token) varies between requests, so a single attempt can 403 on a
+    # format that would succeed moments later. Retry a few times before
+    # giving up.
+    max_attempts = 5
+    result = None
+    last_error: subprocess.CalledProcessError | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            break
+        except FileNotFoundError as exc:
+            raise PipelineError(
+                "Не найден yt-dlp. Установите его: pip install yt-dlp"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            if attempt < max_attempts:
+                delay = 3 * attempt
+                print(
+                    f"⚠️  yt-dlp попытка {attempt}/{max_attempts} "
+                    f"не удалась, повторяю через {delay}с..."
+                )
+                time.sleep(delay)
+
+    if result is None:
         detail = (
-            exc.stderr
-            or exc.stdout
+            last_error.stderr
+            or last_error.stdout
             or "yt-dlp завершился с ошибкой"
         ).strip()
 
         raise PipelineError(
             f"yt-dlp: {detail[-2000:]}"
-        ) from exc
+        ) from last_error
 
     candidates = [
         Path(line.strip())
@@ -302,7 +321,16 @@ def download_video(url: str, output_dir: str | Path) -> Path:
             "yt-dlp завершился, но скачанный файл не найден."
         )
 
-    return normalize_video(downloaded)
+    normalized = normalize_video(downloaded)
+
+    try:
+        validate_video(normalized)
+    except ValidationError as exc:
+        raise PipelineError(
+            f"Скачанное видео не прошло проверку: {exc}"
+        ) from exc
+
+    return normalized
 
 
 def _resolve_output_root(output_root: str | Path) -> Path:
@@ -347,16 +375,13 @@ def run_pipeline(
             raise PipelineError(f"Файл не найден: {source_path}")
         elif not source_path.is_file():
             raise PipelineError(f"Это не файл: {source_path}")
-
         try:
-            duration = probe_duration(source_path)
-        except FileNotFoundError as exc:
-            raise PipelineError("Не найден ffprobe/ffmpeg. Установите FFmpeg: brew install ffmpeg") from exc
-        except subprocess.CalledProcessError as exc:
-            raise PipelineError(f"Не удалось прочитать видео через ffprobe: {exc}") from exc
-        except Exception as exc:
-            raise PipelineError(f"Не удалось определить длительность видео: {exc}") from exc
-
+            video_info = validate_video(source_path)
+            duration = video_info.duration
+        except ValidationError as exc:
+            raise PipelineError(
+                f"Видео не прошло проверку: {exc}" ) from exc
+        
         video_name = safe_name(source_path.stem)
         run_dir = _new_run_dir(output_root, video_name)
         source_dir = run_dir / "source"
@@ -438,6 +463,7 @@ def run_pipeline(
         if was_split:
             print(f"✂️  {duration:.1f}с → режу на {segment_duration}с")
             raw_clips = render_cuts(stored_source, clips_dir, cuts)
+                
         else:
             print(f"⏭️  {duration:.1f}с → короче лимита, не режу")
             raw_clips = [(stored_source, 0.0, duration)]
@@ -446,15 +472,47 @@ def run_pipeline(
         for idx, (clip_path, start, end) in enumerate(raw_clips, 1):
             final_path = Path(clip_path)
             subtitle_path = None
+            try:
+                clip_info = validate_video(clip_path)
+            except ValidationError as exc:
+                raise PipelineError(
+                    f"Clip {idx:03d} не прошёл проверку: {exc}"
+                ) from exc
+            expected_duration = end - start
 
+            if abs(clip_info.duration - expected_duration) > 1.0:
+                raise PipelineError(
+                    f"Clip {idx:03d} имеет неправильную длительность: "
+                    f"{clip_info.duration:.3f}s вместо "
+                    f"{expected_duration:.3f}s"
+                )
             if subtitles_generated and subtitle_data:
                 subtitle_path = subs_dir / f"clip_{idx:03d}.srt"
-                write_clip_srts(subtitle_data["segments"], start, end, subtitle_path)
+                write_clip_srts(
+                    subtitle_data["segments"],
+                    start,
+                    end,
+                    subtitle_path,)
+                try:
+                    validate_srt(subtitle_path,duration=end - start,)
+                except ValidationError as exc:
+                    raise PipelineError(
+                   f"Сгенерированный SRT для clip_{idx:03d} "
+                 f"не прошёл проверку: {exc}"
+                ) from exc
                 burned = clips_dir / f"clip_{idx:03d}_subtitled.mp4"
                 try:
                     burn_subtitles(final_path, subtitle_path, burned)
                 except subprocess.CalledProcessError as exc:
                     raise PipelineError(f"Не удалось наложить субтитры на clip_{idx:03d}: {exc}") from exc
+
+                try:
+                    validate_video(burned)
+                except ValidationError as exc:
+                    raise PipelineError(
+                        f"Готовый clip_{idx:03d}_subtitled.mp4 "
+                        f"не прошёл проверку: {exc}"
+                    ) from exc
                 if final_path != stored_source:
                     final_path.unlink(missing_ok=True)
                 final_path = burned

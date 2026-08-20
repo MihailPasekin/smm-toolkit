@@ -7,63 +7,55 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from dataclasses import asdict
 
 
 try:
+    from .errors import PipelineError
+    from .models import ClipInfo, Metadata
     from .media import has_audio, is_url, probe_duration, safe_name
     from .speech import has_speech
     from .subtitles import transcribe_to_srt, write_clip_srts
     from .render import burn_subtitles, render_cuts
     from .cut_strategy import FixedDurationCutStrategy
     from .validator import validate_video, validate_srt, ValidationError
+    from .interactive import prompt_for_options
+    from .audio import download_audio, extract_audio
 except ImportError:
+    from errors import PipelineError
+    from models import ClipInfo, Metadata
     from media import has_audio, is_url, probe_duration, safe_name
     from speech import has_speech
     from subtitles import transcribe_to_srt, write_clip_srts
     from render import burn_subtitles, render_cuts
     from cut_strategy import FixedDurationCutStrategy
     from validator import validate_video, validate_srt, ValidationError
-
+    from interactive import prompt_for_options
+    from audio import download_audio, extract_audio
 VERSION = "1.5.0"
 
-
-class PipelineError(RuntimeError):
-    pass
+QUALITY_CHOICES = ("best", "1080", "720", "480", "360")
 
 
-@dataclass
-class ClipInfo:
-    index: int
-    path: str
-    start: float
-    end: float
-    duration: float
-    subtitle_path: str | None = None
+def build_video_format_selector(quality: str) -> str:
+    """Return a yt-dlp selector for the requested maximum video height."""
+    if quality not in QUALITY_CHOICES:
+        raise PipelineError(f"Неизвестное качество: {quality}")
+
+    if quality == "best":
+        return "best[protocol^=m3u8]/best[ext=mp4]/best"
+
+    height_filter = f"[height<={quality}]"
+    return (
+        f"best[protocol^=m3u8]{height_filter}/"
+        f"best[ext=mp4]{height_filter}/"
+        f"best{height_filter}"
+    )
 
 
-@dataclass
-class Metadata:
-    version: str
-    created_at: str
-    source_input: str
-    source_path: str
-    source_url: str | None
-    source_filename: str
-    duration: float
-    segment_duration: int
-    was_split: bool
-    speech_detected: bool
-    subtitles_mode: str
-    subtitles_generated: bool
-    subtitles_skipped_reason: str | None
-    transcription_attempted: bool
-    transcription_segments: int
-    detected_language: str | None
-    clips: list[ClipInfo]
-    errors: list[str]
 
 
 
@@ -230,7 +222,11 @@ def normalize_video(video_path: str | Path) -> Path:
     return normalized
 
 
-def download_video(url: str, output_dir: str | Path) -> Path:
+def download_video(
+    url: str,
+    output_dir: str | Path,
+    quality: str = "best",
+) -> Path:
     """Download a video and normalize it to a widely compatible MP4."""
 
     output_dir = Path(output_dir)
@@ -242,7 +238,7 @@ def download_video(url: str, output_dir: str | Path) -> Path:
         "yt-dlp",
         "--no-playlist",
         "-f",
-        "best[protocol^=m3u8]/best[ext=mp4]/best",
+        build_video_format_selector(quality),
         "--merge-output-format",
         "mp4",
         "--print",
@@ -351,16 +347,27 @@ def _new_run_dir(output_root: Path, video_name: str) -> Path:
 
 def run_pipeline(
     source: str,
-    segment_duration: int = 60,
+    segment_duration: int | None = 60,
     subtitles: str = "auto",
     output_root: str | Path = "output",
+    quality: str = "best",
+    output_mode: str | None = None,
 ) -> Path:
-    if segment_duration <= 0:
+    if segment_duration is not None and segment_duration <= 0:
         raise PipelineError("segment_duration должен быть больше 0.")
     if subtitles not in {"auto", "yes", "no"}:
         raise PipelineError("--subtitles должен быть auto, yes или no.")
+    if quality not in QUALITY_CHOICES:
+        raise PipelineError(f"Неизвестное качество: {quality}")
+    if output_mode not in {None, "video", "subtitled", "audio"}:
+        raise PipelineError("--mode должен быть video, subtitled или audio.")
     if not source or not source.strip():
         raise PipelineError("Источник видео не указан.")
+
+    if output_mode == "video":
+        subtitles = "no"
+    elif output_mode == "subtitled":
+        subtitles = "yes"
 
     output_root = _resolve_output_root(output_root)
     source_url = source if is_url(source) else None
@@ -368,19 +375,27 @@ def run_pipeline(
 
     with tempfile.TemporaryDirectory(prefix="smm_toolkit_") as tmp:
         tmp_dir = Path(tmp)
+        is_direct_audio_download = output_mode == "audio" and source_url is not None
         if source_url:
             print(f"⬇️  Скачивание: {source_url}")
-            source_path = download_video(source_url, tmp_dir)
+            if is_direct_audio_download:
+                source_path = download_audio(source_url, tmp_dir)
+            else:
+                source_path = download_video(source_url, tmp_dir, quality)
         elif not source_path.exists():
             raise PipelineError(f"Файл не найден: {source_path}")
         elif not source_path.is_file():
             raise PipelineError(f"Это не файл: {source_path}")
         try:
-            video_info = validate_video(source_path)
-            duration = video_info.duration
-        except ValidationError as exc:
-            raise PipelineError(
-                f"Видео не прошло проверку: {exc}" ) from exc
+            if is_direct_audio_download or (
+                output_mode == "audio" and source_path.suffix.lower() == ".mp3"
+            ):
+                duration = probe_duration(source_path)
+            else:
+                video_info = validate_video(source_path)
+                duration = video_info.duration
+        except (ValidationError, ValueError) as exc:
+            raise PipelineError(f"Медиа не прошло проверку: {exc}") from exc
         
         video_name = safe_name(source_path.stem)
         run_dir = _new_run_dir(output_root, video_name)
@@ -393,6 +408,45 @@ def run_pipeline(
 
         stored_source = source_dir / source_path.name
         shutil.copy2(source_path, stored_source)
+
+        if output_mode == "audio":
+            audio_dir = run_dir / "audio"
+            audio_dir.mkdir()
+            audio_file = audio_dir / f"{source_path.stem}.mp3"
+            if stored_source.suffix.lower() == ".mp3":
+                shutil.copy2(stored_source, audio_file)
+            else:
+                extract_audio(stored_source, audio_file)
+
+            metadata = Metadata(
+                version=VERSION,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                source_input=source,
+                source_path=str(stored_source.relative_to(run_dir)),
+                source_url=source_url,
+                source_filename=stored_source.name,
+                duration=round(duration, 3),
+                segment_duration=None,
+                was_split=False,
+                speech_detected=False,
+                subtitles_mode="no",
+                subtitles_generated=False,
+                subtitles_skipped_reason=None,
+                transcription_attempted=False,
+                transcription_segments=0,
+                detected_language=None,
+                clips=[],
+                errors=[],
+                output_mode="audio",
+                quality=quality,
+                audio_path=str(audio_file.relative_to(run_dir)),
+            )
+            (run_dir / "metadata.json").write_text(
+                json.dumps(asdict(metadata), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"✅ Готово: {run_dir}")
+            return run_dir
 
         errors: list[str] = []
         speech_detected = False
@@ -456,9 +510,13 @@ def run_pipeline(
                 errors.append(f"subtitle generation skipped: {exc}")
 
         # Architecture boundary for future Smart Cut.
-        strategy = FixedDurationCutStrategy()
-        cuts = strategy.plan(duration, segment_duration)
-        was_split = len(cuts) > 1
+        if segment_duration is None:
+            cuts = []
+            was_split = False
+        else:
+            strategy = FixedDurationCutStrategy()
+            cuts = strategy.plan(duration, segment_duration)
+            was_split = len(cuts) > 1
 
         if was_split:
             print(f"✂️  {duration:.1f}с → режу на {segment_duration}с")
@@ -551,6 +609,8 @@ def run_pipeline(
             detected_language=detected_language,
             clips=clips,
             errors=errors,
+            output_mode=output_mode or "video",
+            quality=quality,
         )
         metadata_path = run_dir / "metadata.json"
         metadata_path.write_text(json.dumps(asdict(metadata), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -561,9 +621,12 @@ def run_pipeline(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SMM Toolkit V1.5 — URL/local video → clips + subtitles")
-    parser.add_argument("source", help="URL или путь к локальному видео")
+    parser.add_argument("source", nargs="?", help="URL или путь к локальному видео")
     parser.add_argument("--segment-duration", "--duration", dest="segment_duration", type=int, default=60)
     parser.add_argument("--subtitles", choices=("auto", "yes", "no"), default="auto")
+    parser.add_argument("--mode", choices=("video", "subtitled", "audio"))
+    parser.add_argument("--quality", choices=QUALITY_CHOICES, default="best")
+    parser.add_argument("--no-split", action="store_true")
     parser.add_argument("--output", default="output")
     return parser
 
@@ -571,7 +634,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        run_pipeline(args.source, args.segment_duration, args.subtitles, args.output)
+        if args.source is None:
+            options = prompt_for_options()
+            source = options.source
+            segment_duration = options.segment_duration
+            output_mode = options.mode
+            quality = options.quality
+        else:
+            source = args.source
+            segment_duration = None if args.no_split else args.segment_duration
+            output_mode = args.mode
+            quality = args.quality
+
+        run_pipeline(
+            source,
+            segment_duration=segment_duration,
+            subtitles=args.subtitles,
+            output_root=args.output,
+            quality=quality,
+            output_mode=output_mode,
+        )
         return 0
     except PipelineError as exc:
         print(f"❌ Ошибка: {exc}", file=sys.stderr)

@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from cut_strategy import FixedDurationCutStrategy
 from subtitles import format_time, write_clip_srts
-from toolkit import run_pipeline
+from toolkit import build_parser, build_video_format_selector, run_pipeline
 from validator import VideoInfo
 
 
@@ -139,11 +139,170 @@ def test_no_subtitles_never_runs_vad_or_whisper(tmp_path):
 
 
 def test_cli_accepts_subtitle_modes():
-    from toolkit import build_parser
     parser = build_parser()
     assert parser.parse_args(["video.mp4", "--subtitles", "auto"]).subtitles == "auto"
     assert parser.parse_args(["video.mp4", "--subtitles", "yes"]).subtitles == "yes"
     assert parser.parse_args(["video.mp4", "--subtitles", "no"]).subtitles == "no"
+
+
+def test_cli_accepts_output_mode_quality_and_no_split():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "https://example.com/video",
+            "--mode",
+            "subtitled",
+            "--quality",
+            "720",
+            "--no-split",
+        ]
+    )
+
+    assert args.mode == "subtitled"
+    assert args.quality == "720"
+    assert args.no_split is True
+
+
+def test_cli_source_is_optional_for_interactive_mode():
+    args = build_parser().parse_args([])
+
+    assert args.source is None
+
+
+def test_quality_selector_limits_requested_height_and_prefers_hls():
+    selector = build_video_format_selector("720")
+
+    assert "[height<=720]" in selector
+    assert "[protocol^=m3u8]" in selector
+    assert selector.count("[height<=720]") == 3
+
+
+def test_interactive_dialog_collects_subtitled_video_options():
+    from interactive import prompt_for_options
+
+    answers = iter([
+        "https://example.com/video",
+        "2",  # video with subtitles
+        "3",  # 720p
+        "1",  # split into 60-second clips
+    ])
+
+    options = prompt_for_options(input_func=lambda _prompt: next(answers))
+
+    assert options.source == "https://example.com/video"
+    assert options.mode == "subtitled"
+    assert options.quality == "720"
+    assert options.segment_duration == 60
+
+
+def test_interactive_dialog_skips_quality_and_cut_for_audio():
+    from interactive import prompt_for_options
+
+    answers = iter(["https://example.com/video", "3"])
+
+    options = prompt_for_options(input_func=lambda _prompt: next(answers))
+
+    assert options.mode == "audio"
+    assert options.quality == "best"
+    assert options.segment_duration is None
+
+
+@patch("toolkit.download_video")
+@patch("toolkit.validate_video", return_value=_video_info(125.0))
+def test_pipeline_passes_quality_to_url_download_and_can_skip_cutting(
+    mock_validate, mock_download, tmp_path
+):
+    downloaded = tmp_path / "source.mp4"
+    downloaded.write_bytes(b"fake")
+    mock_download.return_value = downloaded
+
+    out = run_pipeline(
+        "https://example.com/video",
+        segment_duration=None,
+        subtitles="no",
+        quality="720",
+        output_root=tmp_path / "out",
+    )
+
+    assert mock_download.call_args.args[0] == "https://example.com/video"
+    assert mock_download.call_args.args[2] == "720"
+    metadata = json.loads((out / "metadata.json").read_text(encoding="utf8"))
+    assert metadata["was_split"] is False
+    assert metadata["quality"] == "720"
+
+
+@patch("toolkit.extract_audio", side_effect=lambda _source, target: Path(target).write_bytes(b"mp3"))
+@patch("toolkit.validate_video", return_value=_video_info(20.0))
+@patch("toolkit.transcribe_to_srt")
+@patch("toolkit.has_speech")
+def test_audio_mode_exports_mp3_and_skips_subtitles_and_cutting(
+    mock_speech, mock_transcribe, mock_validate, mock_extract_audio, tmp_path
+):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake")
+
+    out = run_pipeline(
+        str(video),
+        output_mode="audio",
+        output_root=tmp_path / "out",
+    )
+
+    assert (out / "audio" / "video.mp3").read_bytes() == b"mp3"
+    mock_extract_audio.assert_called_once()
+    mock_speech.assert_not_called()
+    mock_transcribe.assert_not_called()
+    metadata = json.loads((out / "metadata.json").read_text(encoding="utf8"))
+    assert metadata["output_mode"] == "audio"
+    assert metadata["audio_path"] == "audio/video.mp3"
+    assert metadata["clips"] == []
+
+
+@patch("toolkit.download_audio")
+@patch("toolkit.probe_duration", return_value=20.0)
+@patch("toolkit.validate_video")
+def test_audio_mode_downloads_mp3_directly_from_url(
+    mock_validate, mock_duration, mock_download, tmp_path
+):
+    downloaded = tmp_path / "source.mp3"
+    downloaded.write_bytes(b"mp3")
+    mock_download.return_value = downloaded
+
+    out = run_pipeline(
+        "https://example.com/video",
+        output_mode="audio",
+        output_root=tmp_path / "out",
+    )
+
+    mock_download.assert_called_once()
+    mock_validate.assert_not_called()
+    assert (out / "audio" / "source.mp3").read_bytes() == b"mp3"
+
+
+@patch("toolkit.run_pipeline")
+@patch("toolkit.prompt_for_options")
+def test_main_uses_interactive_options_when_source_is_not_provided(
+    mock_prompt, mock_pipeline, monkeypatch
+):
+    from interactive import UserOptions
+    from toolkit import main
+
+    mock_prompt.return_value = UserOptions(
+        source="https://example.com/video",
+        mode="subtitled",
+        quality="720",
+        segment_duration=None,
+    )
+    monkeypatch.setattr(sys, "argv", ["toolkit.py"])
+
+    assert main() == 0
+    mock_pipeline.assert_called_once_with(
+        "https://example.com/video",
+        segment_duration=None,
+        subtitles="auto",
+        output_root="output",
+        quality="720",
+        output_mode="subtitled",
+    )
 
 
 @patch("toolkit.has_speech", return_value=True)

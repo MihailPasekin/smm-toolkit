@@ -15,7 +15,7 @@ from dataclasses import asdict
 
 try:
     from .errors import PipelineError
-    from .models import ClipInfo, Metadata
+    from .models.modelsClipInfo import ClipInfo, Metadata
     from .media import has_audio, is_url, probe_duration, safe_name
     from .speech import has_speech
     from .subtitles import transcribe_to_srt, write_clip_srts
@@ -26,7 +26,7 @@ try:
     from .audio import download_audio, extract_audio
 except ImportError:
     from errors import PipelineError
-    from models import ClipInfo, Metadata
+    from models.modelsClipInfo import ClipInfo, Metadata
     from media import has_audio, is_url, probe_duration, safe_name
     from speech import has_speech
     from subtitles import transcribe_to_srt, write_clip_srts

@@ -1,6 +1,8 @@
+# scripts/models/modelsClipInfo.py
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional, List
 
 
 @dataclass
@@ -10,7 +12,7 @@ class ClipInfo:
     start: float
     end: float
     duration: float
-    subtitle_path: str | None = None
+    subtitle_path: Optional[str] = None
 
 
 @dataclass
@@ -19,20 +21,20 @@ class Metadata:
     created_at: str
     source_input: str
     source_path: str
-    source_url: str | None
+    source_url: Optional[str]
     source_filename: str
     duration: float
-    segment_duration: int | None
+    segment_duration: Optional[int]
     was_split: bool
     speech_detected: bool
     subtitles_mode: str
     subtitles_generated: bool
-    subtitles_skipped_reason: str | None
+    subtitles_skipped_reason: Optional[str]
     transcription_attempted: bool
     transcription_segments: int
-    detected_language: str | None
-    clips: list[ClipInfo]
-    errors: list[str]
-    output_mode: str = "video"
-    quality: str = "best"
-    audio_path: str | None = None
+    detected_language: Optional[str]
+    clips: List[ClipInfo]
+    errors: List[str]
+    output_mode: str
+    quality: str
+    audio_path: Optional[str] = None

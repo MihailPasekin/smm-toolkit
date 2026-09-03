@@ -1,57 +1,52 @@
+# scripts/media.py
 from __future__ import annotations
 
-import re
-import subprocess
 from pathlib import Path
-from urllib.parse import urlparse
+from datetime import datetime
+from typing import Union
 
+def is_url(string: str) -> bool:
+    return string.startswith(("http://", "https://"))
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg"}
+def safe_name(name: str) -> str:
+    return "".join(c for c in name if c.isalnum() or c in " -_").strip()
 
+def _resolve_output_root(output_root: Union[str, Path]) -> Path:
+    root = Path(output_root).expanduser()
+    if not root.is_absolute():
+        root = Path(__file__).resolve().parent.parent / root
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
-def is_url(value: str) -> bool:
-    parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+def _new_run_dir(output_root: Path, video_name: str) -> Path:
+    candidate = output_root / video_name
+    if not candidate.exists():
+        return candidate
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return output_root / f"{video_name}_{timestamp}"
 
-
-def safe_name(name: str, max_len: int = 100) -> str:
-    name = re.sub(r"[^\w\-. ]+", "_", name, flags=re.UNICODE)
-    name = re.sub(r"\s+", "_", name).strip("._")
-    return (name[:max_len] or "video")
-
-
-def probe_duration(video_path: str | Path) -> float:
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(video_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+def probe_duration(media_path: Path) -> float:
+    import subprocess
     try:
-        duration = float(result.stdout.strip())
-    except ValueError as exc:
-        raise ValueError(f"ffprobe вернул некорректную длительность: {result.stdout!r}") from exc
-    if duration <= 0:
-        raise ValueError(f"Некорректная длительность: {duration}")
-    return duration
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(media_path)],
+            capture_output=True, text=True, check=True
+        )
+        return float(result.stdout.strip())
+    except Exception as exc:
+        from errors import PipelineError
+        raise PipelineError(f"Не удалось получить длительность: {exc}") from exc
 
-
-def has_audio(video_path: str | Path) -> bool:
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=index",
-            "-of", "csv=p=0",
-            str(video_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return bool(result.stdout.strip())
+def has_audio(video_path: Path) -> bool:
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip() == "audio"
+    except subprocess.CalledProcessError:
+        return False

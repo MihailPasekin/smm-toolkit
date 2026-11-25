@@ -40,3 +40,4 @@ output/*
 *.log
 EOF.venv311/
 .venv/
+scripts/youtube_api_key.txt
